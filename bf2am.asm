@@ -8,10 +8,24 @@ section .bss
 block:    resb 64
 digest:   resb 16
 hexbuf:   resb 40
+sock:     resd 1
+rxlen:    resq 1
+rxbuf:    resb 16384
+cmdbuf:   resb 512
+msgbuf:   resb 64
+pass_ptr: resq 1
+sa:       resb 16
 
 section .data
 hexchars: db "0123456789abcdef"
 nl:       db 10
+s_seed:   db "seed: ", 0
+s_ok:     db "uthentication successful", 0
+s_login:  db "login ", 0
+s_usage:  db "usage: bf2am <ip> <port> <rcon password>", 10, 0
+s_authok: db "authenticated", 10, 0
+s_authno: db "auth failed", 10, 0
+s_noconn: db "cant connect", 10, 0
 
 section .text
 global _start
@@ -124,29 +138,291 @@ to_hex:
     jb .l
     ret
 
-; temp main: print md5 of argv[1]
-_start:
-    mov rdi, [rsp+16]
-    xor esi, esi
-    mov rax, rdi
-.sl:
-    cmp byte [rax+rsi], 0
-    je .sd
+
+strlen:
+    xor eax, eax
+.l:
+    cmp byte [rdi+rax], 0
+    je .d
+    inc rax
+    jmp .l
+.d:
+    ret
+
+; rdi = zstr -> stdout
+log_z:
+    push rdi
+    call strlen
+    mov rdx, rax
+    pop rsi
+    mov edi, 1
+    mov eax, 1
+    syscall
+    ret
+
+; rdi = dest, rsi = zstr; returns rdi at end
+append:
+.l:
+    mov al, [rsi]
+    test al, al
+    jz .d
+    mov [rdi], al
+    inc rdi
     inc rsi
-    jmp .sl
-.sd:
+    jmp .l
+.d:
+    ret
+
+; rdi = hay, rsi = needle -> rax ptr or 0
+find_sub:
+.outer:
+    mov rax, rdi
+    mov rdx, rsi
+.cmp:
+    mov cl, [rdx]
+    test cl, cl
+    jz .found
+    cmp cl, [rax]
+    jne .next
+    inc rax
+    inc rdx
+    jmp .cmp
+.next:
+    cmp byte [rdi], 0
+    je .nf
+    inc rdi
+    jmp .outer
+.found:
+    mov rax, rdi
+    ret
+.nf:
+    xor eax, eax
+    ret
+
+; rdi = "a.b.c.d" -> eax network order
+parse_ip:
+    xor edx, edx
+    xor ecx, ecx
+.oct:
+    xor eax, eax
+.dig:
+    movzx esi, byte [rdi]
+    sub esi, '0'
+    cmp esi, 9
+    ja .end
+    imul eax, eax, 10
+    add eax, esi
+    inc rdi
+    jmp .dig
+.end:
+    and eax, 255
+    shl eax, cl
+    or edx, eax
+    add ecx, 8
+    cmp ecx, 32
+    jae .done
+    inc rdi
+    jmp .oct
+.done:
+    mov eax, edx
+    ret
+
+parse_uint:
+    xor eax, eax
+.dig:
+    movzx esi, byte [rdi]
+    sub esi, '0'
+    cmp esi, 9
+    ja .d
+    imul eax, eax, 10
+    add eax, esi
+    inc rdi
+    jmp .dig
+.d:
+    ret
+
+; edi = timeout ms. eax = bytes read, 0 on timeout, -1 on eof/error
+recv_some:
+    sub rsp, 16
+    mov eax, [sock]
+    mov [rsp], eax
+    mov word [rsp+4], 1
+    mov word [rsp+6], 0
+    mov edx, edi
+    mov rdi, rsp
+    mov esi, 1
+    mov eax, 7
+    syscall
+    add rsp, 16
+    test eax, eax
+    jle .none
+    mov rdx, 16383
+    sub rdx, [rxlen]
+    jle .none
+    lea rsi, [rxbuf]
+    add rsi, [rxlen]
+    mov edi, [sock]
+    xor eax, eax
+    syscall
+    test rax, rax
+    jle .eof
+    add [rxlen], rax
+    mov rcx, [rxlen]
+    mov byte [rxbuf+rcx], 0
+    ret
+.none:
+    xor eax, eax
+    ret
+.eof:
+    mov eax, -1
+    ret
+
+; rdi = end of cmd in cmdbuf
+send_cmd:
+    lea rsi, [cmdbuf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov edi, [sock]
+    mov eax, 1
+    syscall
+    ret
+
+; 0 ok, 1 retry, 2 bad auth
+connect_login:
+    mov eax, 41
+    mov edi, 2
+    mov esi, 1
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .retry
+    mov [sock], eax
+    mov edi, eax
+    lea rsi, [sa]
+    mov edx, 16
+    mov eax, 42
+    syscall
+    test rax, rax
+    js .retry
+    mov qword [rxlen], 0
+    mov byte [rxbuf], 0
+    mov ebx, 8
+.ws:
+    mov edi, 2000
+    call recv_some
+    test eax, eax
+    js .retry
+    lea rdi, [rxbuf]
+    lea rsi, [s_seed]
+    call find_sub
+    test rax, rax
+    jz .more
+    lea rsi, [rax+6]
+    lea rdx, [rxbuf]
+    add rdx, [rxlen]
+    lea rcx, [rsi+16]
+    cmp rcx, rdx
+    ja .more
+    mov rax, [rsi]
+    mov [msgbuf], rax
+    mov rax, [rsi+8]
+    mov [msgbuf+8], rax
+    jmp .got
+.more:
+    dec ebx
+    jnz .ws
+    jmp .retry
+.got:
+    mov rdi, [pass_ptr]
+    call strlen
+    cmp rax, 39
+    ja .bad
+    mov r12, rax
+    lea rdi, [msgbuf+16]
+    mov rsi, [pass_ptr]
+.cp:
+    mov al, [rsi]
+    test al, al
+    jz .cpd
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .cp
+.cpd:
+    lea rdi, [msgbuf]
+    lea rsi, [r12+16]
     call md5
     call to_hex
-    mov eax, 1
-    mov edi, 1
+    lea rdi, [cmdbuf]
+    lea rsi, [s_login]
+    call append
     lea rsi, [hexbuf]
-    mov edx, 32
-    syscall
+    mov ecx, 32
+.hx:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .hx
+    mov byte [rdi], 10
+    inc rdi
+    call send_cmd
+    mov qword [rxlen], 0
+    mov byte [rxbuf], 0
+    mov ebx, 4
+.wa:
+    mov edi, 1000
+    call recv_some
+    lea rdi, [rxbuf]
+    lea rsi, [s_ok]
+    call find_sub
+    test rax, rax
+    jnz .ok
+    dec ebx
+    jnz .wa
+.bad:
+    mov eax, 2
+    ret
+.ok:
+    xor eax, eax
+    ret
+.retry:
     mov eax, 1
+    ret
+
+usage:
+    lea rdi, [s_usage]
+    call log_z
+    mov eax, 60
     mov edi, 1
-    lea rsi, [nl]
-    mov edx, 1
     syscall
+
+_start:
+    cmp qword [rsp], 4
+    jb usage
+    lea r13, [rsp+8]
+    mov rdi, [r13+8]
+    call parse_ip
+    mov [sa+4], eax
+    mov word [sa], 2
+    mov rdi, [r13+16]
+    call parse_uint
+    xchg al, ah
+    mov [sa+2], ax
+    mov rax, [r13+24]
+    mov [pass_ptr], rax
+    call connect_login
+    test eax, eax
+    jnz .fail
+    lea rdi, [s_authok]
+    call log_z
     mov eax, 60
     xor edi, edi
+    syscall
+.fail:
+    lea rdi, [s_authno]
+    call log_z
+    mov eax, 60
+    mov edi, 2
     syscall
