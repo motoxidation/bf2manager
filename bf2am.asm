@@ -15,6 +15,13 @@ cmdbuf:   resb 512
 msgbuf:   resb 64
 pass_ptr: resq 1
 sa:       resb 16
+filebuf:  resb 8192
+kick_n:   resq 1
+kick_tab: resb 32*64
+interval: resq 1
+idbuf:    resb 16
+namebuf:  resb 64
+ipbuf:    resb 24
 
 section .data
 hexchars: db "0123456789abcdef"
@@ -26,6 +33,16 @@ s_usage:  db "usage: bf2am <ip> <port> <rcon password>", 10, 0
 s_authok: db "authenticated", 10, 0
 s_authno: db "auth failed", 10, 0
 s_noconn: db "cant connect", 10, 0
+s_rules:  db "rules.conf", 0
+s_id:     db "Id: ", 0
+s_name:   db "Name: ", 0
+s_remote: db " is remote ip: ", 0
+s_kw_kick: db "kick ", 0
+s_kw_int: db "interval ", 0
+s_listp:  db "exec admin.listPlayers", 10, 0
+s_kickc:  db "exec admin.kickPlayer ", 0
+s_lkick:  db "kick ", 0
+s_gone:   db "lost connection, retrying", 10, 0
 
 section .text
 global _start
@@ -391,6 +408,283 @@ connect_login:
     mov eax, 1
     ret
 
+
+; rdi = line ptr, rsi = keyword. rax = ptr after keyword or 0
+match_kw:
+.l:
+    mov al, [rsi]
+    test al, al
+    jz .y
+    cmp al, [rdi]
+    jne .n
+    inc rdi
+    inc rsi
+    jmp .l
+.y:
+    mov rax, rdi
+    ret
+.n:
+    xor eax, eax
+    ret
+
+; rdi = dest, rsi = src, edx = max len incl nul. lowercases, trims trailing space
+copy_lower:
+    xor ecx, ecx
+    dec edx
+.l:
+    cmp ecx, edx
+    jae .d
+    movzx eax, byte [rsi+rcx]
+    test al, al
+    jz .d
+    lea r8d, [rax-'A']
+    cmp r8d, 25
+    ja .s
+    or al, 0x20
+.s:
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .l
+.d:
+    test ecx, ecx
+    jz .e
+    cmp byte [rdi+rcx-1], ' '
+    jne .e
+    dec ecx
+    jmp .d
+.e:
+    mov byte [rdi+rcx], 0
+    ret
+
+; rdi = buf, r15 = handler(rdi = line). splits on \n and \r
+for_lines:
+    push r13
+    mov r13, rdi
+.next:
+    mov rdi, r13
+    mov rax, r13
+.scan:
+    mov dl, [rax]
+    test dl, dl
+    jz .last
+    cmp dl, 10
+    je .eol
+    cmp dl, 13
+    je .eol
+    inc rax
+    jmp .scan
+.eol:
+    mov byte [rax], 0
+    lea r13, [rax+1]
+    call r15
+    jmp .next
+.last:
+    call r15
+    pop r13
+    ret
+
+rule_line:
+.sp:
+    cmp byte [rdi], ' '
+    jne .a
+    inc rdi
+    jmp .sp
+.a:
+    cmp byte [rdi], 0
+    je .out
+    cmp byte [rdi], '#'
+    je .out
+    mov rbx, rdi
+    lea rsi, [s_kw_kick]
+    call match_kw
+    test rax, rax
+    jz .t2
+    mov rcx, [kick_n]
+    cmp rcx, 32
+    jae .out
+    mov rsi, rax
+    shl rcx, 6
+    lea rdi, [kick_tab+rcx]
+    mov edx, 64
+    call copy_lower
+    inc qword [kick_n]
+    ret
+.t2:
+    mov rdi, rbx
+    lea rsi, [s_kw_int]
+    call match_kw
+    test rax, rax
+    jz .out
+    mov rdi, rax
+    call parse_uint
+    test rax, rax
+    jz .out
+    mov [interval], rax
+.out:
+    ret
+
+; rdi = path
+load_rules:
+    mov eax, 2
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .none
+    mov r12, rax
+    mov edi, eax
+    lea rsi, [filebuf]
+    mov edx, 8191
+    xor eax, eax
+    syscall
+    mov rbx, rax
+    test rax, rax
+    jg .ok
+    xor ebx, ebx
+.ok:
+    mov byte [filebuf+rbx], 0
+    mov rdi, r12
+    mov eax, 3
+    syscall
+    lea rdi, [filebuf]
+    lea r15, [rule_line]
+    call for_lines
+.none:
+    ret
+
+now:
+    sub rsp, 16
+    mov edi, 1
+    mov rsi, rsp
+    mov eax, 228
+    syscall
+    mov rax, [rsp]
+    add rsp, 16
+    ret
+
+; rdi = seconds
+sleep_secs:
+    sub rsp, 16
+    mov [rsp], rdi
+    mov qword [rsp+8], 0
+    mov rdi, rsp
+    xor esi, esi
+    mov eax, 35
+    syscall
+    add rsp, 16
+    ret
+
+; line handler for listPlayers output
+proc_player:
+    push rbx
+    push r12
+    push r14
+    mov r12, rdi
+    lea rsi, [s_id]
+    call find_sub
+    test rax, rax
+    jz .out
+    lea rsi, [rax+4]
+.skip:
+    cmp byte [rsi], ' '
+    jne .id
+    inc rsi
+    jmp .skip
+.id:
+    lea rdi, [idbuf]
+    xor ecx, ecx
+.idl:
+    movzx eax, byte [rsi]
+    lea edx, [rax-'0']
+    cmp edx, 9
+    ja .idd
+    cmp ecx, 7
+    jae .idd
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .idl
+.idd:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .out
+    mov rdi, r12
+    lea rsi, [s_name]
+    call find_sub
+    test rax, rax
+    jz .out
+    lea r14, [rax+6]
+    mov rdi, r14
+    lea rsi, [s_remote]
+    call find_sub
+    mov rbx, rax
+    test rax, rax
+    jnz .hasip
+    mov rdi, r14
+    call strlen
+    mov rcx, rax
+    jmp .cn
+.hasip:
+    mov rcx, rbx
+    sub rcx, r14
+.cn:
+    cmp rcx, 63
+    jbe .cl
+    mov ecx, 63
+.cl:
+    lea rdi, [namebuf]
+    xor edx, edx
+.cl2:
+    cmp rdx, rcx
+    jae .cd
+    movzx eax, byte [r14+rdx]
+    lea r8d, [rax-'A']
+    cmp r8d, 25
+    ja .nl
+    or al, 0x20
+.nl:
+    mov [rdi+rdx], al
+    inc rdx
+    jmp .cl2
+.cd:
+    mov byte [rdi+rdx], 0
+    xor ebx, ebx
+.kl:
+    cmp rbx, [kick_n]
+    jae .out
+    lea rdi, [namebuf]
+    mov rsi, rbx
+    shl rsi, 6
+    lea rsi, [kick_tab+rsi]
+    call find_sub
+    test rax, rax
+    jnz .kick
+    inc rbx
+    jmp .kl
+.kick:
+    lea rdi, [cmdbuf]
+    lea rsi, [s_kickc]
+    call append
+    lea rsi, [idbuf]
+    call append
+    mov byte [rdi], 10
+    inc rdi
+    call send_cmd
+    lea rdi, [cmdbuf]
+    lea rsi, [s_lkick]
+    call append
+    lea rsi, [namebuf]
+    call append
+    mov byte [rdi], 10
+    mov byte [rdi+1], 0
+    lea rdi, [cmdbuf]
+    call log_z
+.out:
+    pop r14
+    pop r12
+    pop rbx
+    ret
+
 usage:
     lea rdi, [s_usage]
     call log_z
@@ -412,14 +706,53 @@ _start:
     mov [sa+2], ax
     mov rax, [r13+24]
     mov [pass_ptr], rax
+    mov qword [interval], 5
+    lea rdi, [s_rules]
+    cmp qword [rsp], 5
+    jb .lr
+    mov rdi, [r13+32]
+.lr:
+    call load_rules
+.reconnect:
     call connect_login
+    cmp eax, 2
+    je .fail
     test eax, eax
-    jnz .fail
+    jz .loop
+    mov edi, 5
+    call sleep_secs
+    jmp .reconnect
+.loop:
     lea rdi, [s_authok]
     call log_z
-    mov eax, 60
-    xor edi, edi
+.poll:
+    mov qword [rxlen], 0
+    mov byte [rxbuf], 0
+    lea rdi, [cmdbuf]
+    lea rsi, [s_listp]
+    call append
+    call send_cmd
+.dr:
+    mov edi, 700
+    call recv_some
+    test eax, eax
+    jg .dr
+    js .lost
+    lea rdi, [rxbuf]
+    lea r15, [proc_player]
+    call for_lines
+    mov rdi, [interval]
+    call sleep_secs
+    jmp .poll
+.lost:
+    lea rdi, [s_gone]
+    call log_z
+    mov edi, [sock]
+    mov eax, 3
     syscall
+    mov edi, 5
+    call sleep_secs
+    jmp .reconnect
 .fail:
     lea rdi, [s_authno]
     call log_z
