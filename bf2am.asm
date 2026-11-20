@@ -19,6 +19,13 @@ filebuf:  resb 8192
 kick_n:   resq 1
 kick_tab: resb 32*64
 interval: resq 1
+ban_n:    resq 1
+ban_tab:  resb 32*32
+ann_secs: resq 1
+ann_text: resb 208
+map_secs: resq 1
+last_ann: resq 1
+map_start: resq 1
 idbuf:    resb 16
 namebuf:  resb 64
 ipbuf:    resb 24
@@ -39,6 +46,15 @@ s_name:   db "Name: ", 0
 s_remote: db " is remote ip: ", 0
 s_kw_kick: db "kick ", 0
 s_kw_int: db "interval ", 0
+s_kw_ban: db "banip ", 0
+s_kw_ann: db "announce ", 0
+s_kw_map: db "maptime ", 0
+s_banc:   db "exec admin.banPlayer ", 0
+s_perm:   db " Perm", 0
+s_lban:   db "ban ", 0
+s_sayc:   db 'exec game.sayAll "', 0
+s_nextc:  db "exec admin.runNextLevel", 10, 0
+s_lnext:  db "maptime hit, next map", 10, 0
 s_listp:  db "exec admin.listPlayers", 10, 0
 s_kickc:  db "exec admin.kickPlayer ", 0
 s_lkick:  db "kick ", 0
@@ -514,12 +530,72 @@ rule_line:
     lea rsi, [s_kw_int]
     call match_kw
     test rax, rax
-    jz .out
+    jz .t3
     mov rdi, rax
     call parse_uint
     test rax, rax
     jz .out
     mov [interval], rax
+    ret
+.t3:
+    mov rdi, rbx
+    lea rsi, [s_kw_ban]
+    call match_kw
+    test rax, rax
+    jz .t4
+    mov rcx, [ban_n]
+    cmp rcx, 32
+    jae .out
+    mov rsi, rax
+    shl rcx, 5
+    lea rdi, [ban_tab+rcx]
+    mov edx, 32
+    call copy_lower
+    inc qword [ban_n]
+    ret
+.t4:
+    mov rdi, rbx
+    lea rsi, [s_kw_ann]
+    call match_kw
+    test rax, rax
+    jz .t5
+    mov rdi, rax
+    call parse_uint
+    mov [ann_secs], rax
+.sk:
+    cmp byte [rdi], ' '
+    jne .at
+    inc rdi
+    jmp .sk
+.at:
+    mov rsi, rdi
+    lea rdi, [ann_text]
+    xor ecx, ecx
+.ac:
+    cmp ecx, 200
+    jae .ad
+    mov al, [rsi+rcx]
+    test al, al
+    jz .ad
+    cmp al, '"'
+    jne .as
+    mov al, 39
+.as:
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .ac
+.ad:
+    mov byte [rdi+rcx], 0
+    ret
+.t5:
+    mov rdi, rbx
+    lea rsi, [s_kw_map]
+    call match_kw
+    test rax, rax
+    jz .out
+    mov rdi, rax
+    call parse_uint
+    mov [map_secs], rax
 .out:
     ret
 
@@ -550,6 +626,60 @@ load_rules:
     lea r15, [rule_line]
     call for_lines
 .none:
+    ret
+
+strcmp:
+    mov al, [rdi]
+    mov dl, [rsi]
+    cmp al, dl
+    jne .ne
+    test al, al
+    jz .eq
+    inc rdi
+    inc rsi
+    jmp strcmp
+.eq:
+    xor eax, eax
+    ret
+.ne:
+    mov eax, 1
+    ret
+
+; announcements + map timer
+timers:
+    call now
+    mov rbx, rax
+    cmp qword [ann_secs], 0
+    je .nm
+    mov rax, rbx
+    sub rax, [last_ann]
+    cmp rax, [ann_secs]
+    jb .nm
+    mov [last_ann], rbx
+    lea rdi, [cmdbuf]
+    lea rsi, [s_sayc]
+    call append
+    lea rsi, [ann_text]
+    call append
+    mov byte [rdi], '"'
+    mov byte [rdi+1], 10
+    add rdi, 2
+    call send_cmd
+.nm:
+    cmp qword [map_secs], 0
+    je .td
+    mov rax, rbx
+    sub rax, [map_start]
+    cmp rax, [map_secs]
+    jb .td
+    mov [map_start], rbx
+    lea rdi, [cmdbuf]
+    lea rsi, [s_nextc]
+    call append
+    call send_cmd
+    lea rdi, [s_lnext]
+    call log_z
+.td:
     ret
 
 now:
@@ -648,10 +778,32 @@ proc_player:
     jmp .cl2
 .cd:
     mov byte [rdi+rdx], 0
+    mov byte [ipbuf], 0
+    test rbx, rbx
+    jz .ipd
+    lea rsi, [rbx+15]
+    lea rdi, [ipbuf]
+    xor ecx, ecx
+.ipl:
+    movzx eax, byte [rsi+rcx]
+    cmp al, '.'
+    je .ipk
+    lea edx, [rax-'0']
+    cmp edx, 9
+    ja .ipe
+.ipk:
+    cmp ecx, 20
+    jae .ipe
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .ipl
+.ipe:
+    mov byte [rdi+rcx], 0
+.ipd:
     xor ebx, ebx
 .kl:
     cmp rbx, [kick_n]
-    jae .out
+    jae .bans
     lea rdi, [namebuf]
     mov rsi, rbx
     shl rsi, 6
@@ -661,6 +813,41 @@ proc_player:
     jnz .kick
     inc rbx
     jmp .kl
+.bans:
+    xor ebx, ebx
+.bl:
+    cmp rbx, [ban_n]
+    jae .out
+    lea rdi, [ipbuf]
+    mov rsi, rbx
+    shl rsi, 5
+    lea rsi, [ban_tab+rsi]
+    call strcmp
+    test eax, eax
+    jz .ban
+    inc rbx
+    jmp .bl
+.ban:
+    lea rdi, [cmdbuf]
+    lea rsi, [s_banc]
+    call append
+    lea rsi, [idbuf]
+    call append
+    lea rsi, [s_perm]
+    call append
+    mov byte [rdi], 10
+    inc rdi
+    call send_cmd
+    lea rdi, [cmdbuf]
+    lea rsi, [s_lban]
+    call append
+    lea rsi, [namebuf]
+    call append
+    mov byte [rdi], 10
+    mov byte [rdi+1], 0
+    lea rdi, [cmdbuf]
+    call log_z
+    jmp .out
 .kick:
     lea rdi, [cmdbuf]
     lea rsi, [s_kickc]
@@ -713,6 +900,9 @@ _start:
     mov rdi, [r13+32]
 .lr:
     call load_rules
+    call now
+    mov [last_ann], rax
+    mov [map_start], rax
 .reconnect:
     call connect_login
     cmp eax, 2
@@ -726,6 +916,7 @@ _start:
     lea rdi, [s_authok]
     call log_z
 .poll:
+    call timers
     mov qword [rxlen], 0
     mov byte [rxbuf], 0
     lea rdi, [cmdbuf]
