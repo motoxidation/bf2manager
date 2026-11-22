@@ -1,0 +1,24 @@
+services:
+  bf2:
+    image: startersclan/docker-bf2:v1.5.3153.0
+    restart: unless-stopped
+    ports:
+      - "16567:16567/udp"
+      - "29900:29900/udp"
+    volumes:
+      - ./admin/default.cfg:/server/bf2/admin/default.cfg:ro
+      - ./shared:/shared
+
+  # shares bf2's network so rcon is just 127.0.0.1, nothing published
+  bf2am:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    network_mode: "service:bf2"
+    depends_on:
+      - bf2
+    command: ["127.0.0.1", "4711", "${RCON_PASSWORD}", "/rules.conf"]
+    volumes:
+      - ../rules.conf:/rules.conf:ro
+      - ./shared:/shared

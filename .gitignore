@@ -1,2 +1,5 @@
 bf2am
 *.o
+deploy/.env
+deploy/admin/
+deploy/shared/
