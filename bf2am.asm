@@ -26,6 +26,20 @@ ann_text: resb 208
 map_secs: resq 1
 last_ann: resq 1
 map_start: resq 1
+state_path: resb 128
+act_path: resb 128
+statebuf: resb 8192
+actbuf:   resb 1024
+actlen:   resq 1
+px:       resq 1
+pz:       resq 1
+pscore:   resq 1
+tcount:   resq 3
+tmin:     resq 3
+tmin_txt: resq 3
+bal_diff: resq 1
+bal_cool: resq 1
+last_bal: resq 1
 idbuf:    resb 16
 namebuf:  resb 64
 ipbuf:    resb 24
@@ -53,6 +67,11 @@ s_banc:   db "exec admin.banPlayer ", 0
 s_perm:   db " Perm", 0
 s_lban:   db "ban ", 0
 s_sayc:   db 'exec game.sayAll "', 0
+s_kw_state: db "state ", 0
+s_kw_act: db "actions ", 0
+s_kw_bal: db "balance ", 0
+s_swap:   db "swap ", 0
+s_balmsg: db "autobalance: moving a player to the other team", 0
 s_nextc:  db "exec admin.runNextLevel", 10, 0
 s_lnext:  db "maptime hit, next map", 10, 0
 s_listp:  db "exec admin.listPlayers", 10, 0
@@ -472,6 +491,84 @@ copy_lower:
     mov byte [rdi+rcx], 0
     ret
 
+; like copy_lower but keeps case
+copy_raw:
+    xor ecx, ecx
+    dec edx
+.l:
+    cmp ecx, edx
+    jae .d
+    mov al, [rsi+rcx]
+    test al, al
+    jz .d
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .l
+.d:
+    test ecx, ecx
+    jz .e
+    cmp byte [rdi+rcx-1], ' '
+    jne .e
+    dec ecx
+    jmp .d
+.e:
+    mov byte [rdi+rcx], 0
+    ret
+
+skip_sp:
+    cmp byte [rdi], ' '
+    jne .d
+    inc rdi
+    jmp skip_sp
+.d:
+    ret
+
+parse_int:
+    xor ecx, ecx
+    cmp byte [rdi], '-'
+    jne .p
+    inc rdi
+    inc ecx
+.p:
+    call parse_uint
+    test ecx, ecx
+    jz .r
+    neg rax
+.r:
+    ret
+
+; rsi = text -> sayAll
+say:
+    lea rdi, [cmdbuf]
+    push rsi
+    lea rsi, [s_sayc]
+    call append
+    pop rsi
+    call append
+    mov byte [rdi], '"'
+    mov byte [rdi+1], 10
+    add rdi, 2
+    call send_cmd
+    ret
+
+; rsi = prefix, rdx = id text -> queue line for actions file
+act_add:
+    cmp qword [actlen], 900
+    jae .d
+    lea rdi, [actbuf]
+    add rdi, [actlen]
+    push rdx
+    call append
+    pop rsi
+    call append
+    mov byte [rdi], 10
+    inc rdi
+    lea rax, [actbuf]
+    sub rdi, rax
+    mov [actlen], rdi
+.d:
+    ret
+
 ; rdi = buf, r15 = handler(rdi = line). splits on \n and \r
 for_lines:
     push r13
@@ -592,10 +689,45 @@ rule_line:
     lea rsi, [s_kw_map]
     call match_kw
     test rax, rax
-    jz .out
+    jz .t6
     mov rdi, rax
     call parse_uint
     mov [map_secs], rax
+    ret
+.t6:
+    mov rdi, rbx
+    lea rsi, [s_kw_state]
+    call match_kw
+    test rax, rax
+    jz .t7
+    mov rsi, rax
+    lea rdi, [state_path]
+    mov edx, 128
+    call copy_raw
+    ret
+.t7:
+    mov rdi, rbx
+    lea rsi, [s_kw_act]
+    call match_kw
+    test rax, rax
+    jz .t8
+    mov rsi, rax
+    lea rdi, [act_path]
+    mov edx, 128
+    call copy_raw
+    ret
+.t8:
+    mov rdi, rbx
+    lea rsi, [s_kw_bal]
+    call match_kw
+    test rax, rax
+    jz .out
+    mov rdi, rax
+    call parse_uint
+    mov [bal_diff], rax
+    call skip_sp
+    call parse_uint
+    mov [bal_cool], rax
 .out:
     ret
 
@@ -872,6 +1004,147 @@ proc_player:
     pop rbx
     ret
 
+; P <id> <team> <air> <x> <z> <score> <name>
+state_line:
+    push rbx
+    push r12
+    push r14
+    cmp word [rdi], 0x2050
+    jne .out
+    add rdi, 2
+    call skip_sp
+    mov rsi, rdi
+    lea rdx, [idbuf]
+    xor ecx, ecx
+.ci:
+    movzx eax, byte [rsi+rcx]
+    lea r8d, [rax-'0']
+    cmp r8d, 9
+    ja .cd
+    cmp ecx, 7
+    jae .cd
+    mov [rdx+rcx], al
+    inc ecx
+    jmp .ci
+.cd:
+    mov byte [rdx+rcx], 0
+    call parse_uint
+    mov r12, rax
+    call skip_sp
+    call parse_uint
+    mov r14, rax
+    call skip_sp
+    call parse_uint
+    mov rbx, rax
+    call skip_sp
+    call parse_int
+    mov [px], rax
+    call skip_sp
+    call parse_int
+    mov [pz], rax
+    call skip_sp
+    call parse_int
+    mov [pscore], rax
+    cmp r14, 1
+    jb .out
+    cmp r14, 2
+    ja .out
+    inc qword [tcount+r14*8]
+    mov rax, [pscore]
+    cmp rax, [tmin+r14*8]
+    jge .out
+    mov [tmin+r14*8], rax
+    mov rax, [idbuf]
+    mov [tmin_txt+r14*8], rax
+.out:
+    pop r14
+    pop r12
+    pop rbx
+    ret
+
+; read state file, balance teams, flush actions
+run_state:
+    cmp byte [state_path], 0
+    je .ret
+    mov qword [tcount+8], 0
+    mov qword [tcount+16], 0
+    mov rax, 0x7fffffffffffffff
+    mov [tmin+8], rax
+    mov [tmin+16], rax
+    mov qword [actlen], 0
+    mov eax, 2
+    lea rdi, [state_path]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .ret
+    mov r12, rax
+    mov edi, eax
+    lea rsi, [statebuf]
+    mov edx, 8191
+    xor eax, eax
+    syscall
+    mov rbx, rax
+    test rax, rax
+    jg .rd
+    xor ebx, ebx
+.rd:
+    mov byte [statebuf+rbx], 0
+    mov rdi, r12
+    mov eax, 3
+    syscall
+    lea rdi, [statebuf]
+    lea r15, [state_line]
+    call for_lines
+    ; balance
+    cmp qword [bal_diff], 0
+    je .flush
+    mov rax, [tcount+8]
+    mov rcx, [tcount+16]
+    mov ebx, 1
+    sub rax, rcx
+    jge .abs
+    neg rax
+    mov ebx, 2
+.abs:
+    cmp rax, [bal_diff]
+    jb .flush
+    call now
+    mov rcx, rax
+    sub rcx, [last_bal]
+    cmp rcx, [bal_cool]
+    jb .flush
+    mov [last_bal], rax
+    lea rsi, [s_swap]
+    mov rdx, [tmin_txt+rbx*8]
+    mov [idbuf], rdx
+    lea rdx, [idbuf]
+    call act_add
+    lea rsi, [s_balmsg]
+    call say
+.flush:
+    cmp qword [actlen], 0
+    je .ret
+    mov eax, 2
+    lea rdi, [act_path]
+    mov esi, 0x441
+    mov edx, 0644o
+    syscall
+    test rax, rax
+    js .ret
+    mov r12, rax
+    mov edi, eax
+    lea rsi, [actbuf]
+    mov rdx, [actlen]
+    mov eax, 1
+    syscall
+    mov rdi, r12
+    mov eax, 3
+    syscall
+.ret:
+    ret
+
 usage:
     lea rdi, [s_usage]
     call log_z
@@ -932,6 +1205,7 @@ _start:
     lea rdi, [rxbuf]
     lea r15, [proc_player]
     call for_lines
+    call run_state
     mov rdi, [interval]
     call sleep_secs
     jmp .poll
