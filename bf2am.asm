@@ -40,6 +40,12 @@ tmin_txt: resq 3
 bal_diff: resq 1
 bal_cool: resq 1
 last_bal: resq 1
+nfz_n:    resq 1
+nfz_x:    resq 8
+nfz_z:    resq 8
+nfz_r2:   resq 8
+strikes:  resb 64
+nfzmsg:   resb 96
 idbuf:    resb 16
 namebuf:  resb 64
 ipbuf:    resb 24
@@ -70,6 +76,11 @@ s_sayc:   db 'exec game.sayAll "', 0
 s_kw_state: db "state ", 0
 s_kw_act: db "actions ", 0
 s_kw_bal: db "balance ", 0
+s_kw_nfz: db "nfz ", 0
+s_kill:   db "kill ", 0
+s_nfz1:   db "no fly zone, pilot id ", 0
+s_nfz2:   db " get out", 0
+s_nfz3:   db " was killed for flying in the nfz", 0
 s_swap:   db "swap ", 0
 s_balmsg: db "autobalance: moving a player to the other team", 0
 s_nextc:  db "exec admin.runNextLevel", 10, 0
@@ -721,13 +732,37 @@ rule_line:
     lea rsi, [s_kw_bal]
     call match_kw
     test rax, rax
-    jz .out
+    jz .t9
     mov rdi, rax
     call parse_uint
     mov [bal_diff], rax
     call skip_sp
     call parse_uint
     mov [bal_cool], rax
+    ret
+.t9:
+    mov rdi, rbx
+    lea rsi, [s_kw_nfz]
+    call match_kw
+    test rax, rax
+    jz .out
+    mov rcx, [nfz_n]
+    cmp rcx, 8
+    jae .out
+    mov rdi, rax
+    call parse_int
+    mov rcx, [nfz_n]
+    mov [nfz_x+rcx*8], rax
+    call skip_sp
+    call parse_int
+    mov rcx, [nfz_n]
+    mov [nfz_z+rcx*8], rax
+    call skip_sp
+    call parse_uint
+    imul rax, rax
+    mov rcx, [nfz_n]
+    mov [nfz_r2+rcx*8], rax
+    inc qword [nfz_n]
 .out:
     ret
 
@@ -1045,6 +1080,7 @@ state_line:
     call skip_sp
     call parse_int
     mov [pscore], rax
+    call nfz_check
     cmp r14, 1
     jb .out
     cmp r14, 2
@@ -1060,6 +1096,64 @@ state_line:
     pop r14
     pop r12
     pop rbx
+    ret
+
+; rbx = air flag, r12 = id, idbuf = id text, px/pz = pos
+nfz_check:
+    and r12d, 63
+    cmp rbx, 1
+    jne .clear
+    xor ecx, ecx
+.z:
+    cmp rcx, [nfz_n]
+    jae .clear
+    mov rax, [px]
+    sub rax, [nfz_x+rcx*8]
+    imul rax, rax
+    mov rdx, [pz]
+    sub rdx, [nfz_z+rcx*8]
+    imul rdx, rdx
+    add rax, rdx
+    cmp rax, [nfz_r2+rcx*8]
+    jbe .in
+    inc rcx
+    jmp .z
+.in:
+    inc byte [strikes+r12]
+    cmp byte [strikes+r12], 3
+    jae .kill
+    cmp byte [strikes+r12], 1
+    jne .r
+    lea rdi, [nfzmsg]
+    lea rsi, [s_nfz1]
+    call append
+    lea rsi, [idbuf]
+    call append
+    lea rsi, [s_nfz2]
+    call append
+    mov byte [rdi], 0
+    lea rsi, [nfzmsg]
+    call say
+    ret
+.kill:
+    mov byte [strikes+r12], 0
+    lea rsi, [s_kill]
+    lea rdx, [idbuf]
+    call act_add
+    lea rdi, [nfzmsg]
+    lea rsi, [s_nfz1]
+    call append
+    lea rsi, [idbuf]
+    call append
+    lea rsi, [s_nfz3]
+    call append
+    mov byte [rdi], 0
+    lea rsi, [nfzmsg]
+    call say
+.r:
+    ret
+.clear:
+    mov byte [strikes+r12], 0
     ret
 
 ; read state file, balance teams, flush actions
